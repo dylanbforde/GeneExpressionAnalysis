@@ -1,0 +1,473 @@
+---
+title: "Gene Expression Analysis"
+format: pdf
+editor: visual
+---
+
+```{r}
+#| warning: false
+
+library(DESeq2)
+library(ggplot2)
+library(survival)
+library(glmnet)
+library(tidyr)
+library(dplyr)
+library(tibble)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(pheatmap) # For heatmaps
+library(survminer) #For survival analysis
+
+```
+
+```{r}
+
+untar("./brca_tcga_pan_can_atlas_2018.tar.gz")
+
+```
+
+```{r}
+
+path_name <- "./brca_tcga_pan_can_atlas_2018/"
+rna_path <- paste0(path_name, "data_mrna_seq_v2_rsem.txt")
+clinical_path <- paste0(path_name, "data_clinical_patient.txt")
+cna_path <- paste0(path_name, "data_cna.txt")
+
+rna_data <- read.delim(rna_path)
+
+rna_data_long <- read.delim(rna_path) %>%
+  as_tibble() %>%
+  dplyr::select(Hugo_Symbol, starts_with("TCGA")) %>%
+  pivot_longer(-Hugo_Symbol,
+               names_to = "sample_id",
+               values_to = "expression") %>%
+  rename(gene_id = Hugo_Symbol)
+  
+# Fix clinical data reading to skip metadata rows
+clinical_data <- read.delim(clinical_path, comment.char = "#") %>%
+  rename(patient_id = PATIENT_ID) %>%
+  mutate(sample_id = gsub("-", ".", patient_id)) %>%
+  mutate(sample_id = paste0(sample_id, ".01"))
+  
+# Read CNA data
+cna_data <- read.delim(cna_path) %>%
+  as_tibble() %>%
+  dplyr::select(Hugo_Symbol, starts_with("TCGA")) %>%
+  filter(Hugo_Symbol == "ERBB2") %>%
+  pivot_longer(-Hugo_Symbol,
+               names_to = "sample_id",
+               values_to = "cna_value") %>%
+  mutate(HER2_status = ifelse(
+    cna_value > 0,
+    "Amplified",
+    "Not_Amplified"
+    )) %>%
+  dplyr::select(-Hugo_Symbol)
+
+matched_data <- rna_data_long %>%
+  # Join with HER2 status
+  inner_join(cna_data, by = "sample_id") %>%
+  # Join with clinical data using the new sample_id column
+  inner_join(clinical_data %>%
+               dplyr::select(patient_id ,sample_id, everything()),
+             by = "sample_id")
+
+# Check the dimensions after joining
+print(dim(matched_data))
+
+
+# Convert back to matrix format for DESeq2
+rna_matched <- matched_data %>%
+  dplyr::select(gene_id, sample_id, expression) %>%
+  pivot_wider(names_from = sample_id,
+              values_from = expression)
+
+
+# Now join the datasets using the corrected sample_id
+matched_data <- rna_data_long %>%
+  # Join with HER2 status
+  inner_join(cna_data, by = "sample_id") %>%
+  # Join with clinical data using the new sample_id column
+  inner_join(clinical_data %>% 
+              dplyr::select(patient_id, sample_id, everything()), 
+            by = "sample_id")
+
+
+```
+
+```{r}
+
+# matrix for DESeq2
+rna_matrix <- matched_data %>%
+  # Group by gene and sample, then take the mean if there are duplicates
+  group_by(gene_id, sample_id) %>%
+  summarise(expression = mean(as.numeric(expression)),
+            .groups = 'drop') %>%
+  # Now pivot to wide format
+  pivot_wider(names_from = sample_id,
+              values_from = expression) %>%
+  column_to_rownames("gene_id") %>%
+  as.matrix()
+
+# Verify the matrix
+print("Matrix dimensions:")
+print(dim(rna_matrix))
+print("First few values:")
+print(head(rna_matrix[1:5, 1:5]))
+
+
+# meta data
+meta_data <- matched_data %>%
+  dplyr::select(sample_id, HER2_status) %>%
+  distinct() %>%
+  column_to_rownames("sample_id")
+
+# deseq
+dds <- DESeqDataSetFromMatrix(
+  countData = round(rna_matrix),
+  colData = meta_data,
+  design = ~ HER2_status
+)
+```
+
+```{r}
+
+# Filter low count genes
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep,]
+
+# Run DESeq2
+dds <- DESeq(dds)
+
+# Get results
+res <- results(dds, contrast = c("HER2_status", "Amplified", "Not_Amplified"))
+
+# Convert to dataframe and add gene names
+res_df <- as.data.frame(res) %>%
+  rownames_to_column("gene_id") %>%
+  arrange(padj)  # Sort by adjusted p-value
+
+# Look at the top differentially expressed genes
+print("Top 10 DE genes by adjusted p-value:")
+print(head(res_df, 10))
+
+# Get variance stabilized transformation for visualization
+vst <- varianceStabilizingTransformation(dds)
+
+# Save the DESeq2 results
+saveRDS(list(dds = dds, res = res, vst = vst), "deseq2_results.rds")
+
+# Basic summary of differential expression
+print("Summary of differential expression results:")
+summary(res)
+
+# Number of significant genes (adj p-value < 0.05)
+sig_genes <- sum(res_df$padj < 0.05, na.rm=TRUE)
+print(paste("Number of significantly DE genes (padj < 0.05):", sig_genes))
+
+# Get top 10 DE genes by fold change (add this after DESeq2 analysis)
+top_fc_genes <- res_df %>%
+  arrange(desc(abs(log2FoldChange))) %>%
+  head(10)
+
+print("Top 10 DE genes by fold change:")
+print(top_fc_genes)
+
+```
+
+```{r}
+
+# 1. Create PCA Plot
+# Create PCA plot using VST data
+pca_plot <- plotPCA(vst, intgroup = "HER2_status") +
+  theme_minimal() +
+  ggtitle("PCA Plot of HER2 Status") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Save PCA plot
+ggsave("pca_plot.png", pca_plot, width = 8, height = 6)
+
+# 2. Create Heatmap
+# Get top 50 most variable genes
+top_var_genes <- head(order(rowVars(assay(vst)), decreasing = TRUE), 50)
+mat <- assay(vst)[top_var_genes, ]
+gene_names <- rownames(mat)
+
+# Create annotation dataframe
+annotation_col <- data.frame(
+  HER2_status = colData(vst)$HER2_status,
+  row.names = colnames(mat)
+)
+
+# Create heatmap
+heatmap(mat,
+         annotation_col = annotation_col,
+         show_rownames = TRUE,
+         show_colnames = FALSE,
+         scale = "row",
+         clustering_distance_rows = "correlation",
+         clustering_distance_cols = "correlation",
+         filename = "heatmap.png",
+         width = 10,
+         height = 8)
+```
+
+```{r}
+
+
+# Pathway Enrichment Analysis
+significant_genes <- res_df[!is.na(res_df$padj) & res_df$padj < 0.05, ]
+
+if (nrow(significant_genes) > 0) {
+  # Convert gene symbols to uppercase
+  significant_genes$gene_id <- toupper(significant_genes$gene_id)
+  
+  # Convert to Entrez IDs
+  entrez_ids <- bitr(significant_genes$gene_id, 
+                     fromType = "SYMBOL", 
+                     toType = "ENTREZID", 
+                     OrgDb = "org.Hs.eg.db")
+  
+  if (nrow(entrez_ids) > 0) {
+    # GO Enrichment
+    ego <- enrichGO(gene = entrez_ids$ENTREZID,
+                    OrgDb = org.Hs.eg.db,
+                    ont = "BP",
+                    pAdjustMethod = "BH",
+                    pvalueCutoff = 0.05,
+                    qvalueCutoff = 0.05)
+    
+    if (!is.null(ego) && length(ego$ID) > 0) {
+      # Create and save dotplot
+      tryCatch({
+        p1 <- dotplot(ego, showCategory = 20, 
+                     title = "Top 20 Enriched GO Terms")
+        ggsave("go_enrichment_dotplot.png", p1, width = 12, height = 8)
+      }, error = function(e) {
+        print("Error creating GO dotplot")
+        print(e)
+      })
+      
+      # Save GO results
+      write.csv(as.data.frame(ego), 
+                "go_enrichment_results.csv", 
+                row.names = FALSE)
+      
+      # Create enrichment map if there are enough terms
+      if (length(ego$ID) >= 5) {  # Minimum number of terms for meaningful clustering
+        tryCatch({
+          # Convert to enrichResult object if needed
+          if (!inherits(ego, "enrichResult")) {
+            ego <- new("enrichResult", 
+                      result = as.data.frame(ego),
+                      pvalueCutoff = 0.05,
+                      pAdjustMethod = "BH",
+                      organism = "hsa")
+          }
+          
+          # Calculate term similarity
+          ego_sim <- pairwise_termsim(ego)
+          
+          # Create and save enrichment map
+          p2 <- emapplot(ego_sim, 
+                        showCategory = min(30, length(ego_sim@result$ID)),
+                        min_edge = 0.2,  # Minimum similarity score
+                        layout = "kk")
+          ggsave("go_enrichment_map.png", p2, width = 12, height = 12)
+        }, error = function(e) {
+          print("Error creating enrichment map")
+          print(e)
+          
+          # Try alternative visualization
+          p2_alt <- cnetplot(ego, 
+                           showCategory = min(10, length(ego$ID)),
+                           circular = TRUE,
+                           colorEdge = TRUE)
+          ggsave("go_enrichment_network.png", p2_alt, width = 12, height = 12)
+        })
+      } else {
+        print("Not enough terms for enrichment map")
+      }
+    } else {
+      print("No significant GO terms found")
+    }
+    
+    # KEGG Enrichment
+    ekegg <- enrichKEGG(gene = entrez_ids$ENTREZID,
+                        organism = "hsa",
+                        pvalueCutoff = 0.05)
+    
+    if (!is.null(ekegg) && length(ekegg$ID) > 0) {
+      tryCatch({
+        # Create and save KEGG dotplot
+        p3 <- dotplot(ekegg, showCategory = 20,
+                     title = "Top 20 Enriched KEGG Pathways")
+        ggsave("kegg_enrichment_dotplot.png", p3, width = 12, height = 8)
+        
+        # Save KEGG results
+        write.csv(as.data.frame(ekegg),
+                 "kegg_enrichment_results.csv",
+                 row.names = FALSE)
+        
+        # Try to create KEGG network plot
+        if (length(ekegg$ID) >= 5) {
+          p4 <- cnetplot(ekegg, 
+                        showCategory = min(10, length(ekegg$ID)),
+                        circular = TRUE,
+                        colorEdge = TRUE)
+          ggsave("kegg_enrichment_network.png", p4, width = 12, height = 12)
+        }
+      }, error = function(e) {
+        print("Error in KEGG visualization")
+        print(e)
+      })
+    } else {
+      print("No significant KEGG pathways found")
+    }
+    
+    # Print summary statistics
+    cat("\nSummary Statistics:\n")
+    cat("Number of significant genes:", nrow(significant_genes), "\n")
+    cat("Number of mapped Entrez IDs:", nrow(entrez_ids), "\n")
+    if (!is.null(ego)) {
+      cat("Number of enriched GO terms:", length(ego$ID), "\n")
+    }
+    if (!is.null(ekegg)) {
+      cat("Number of enriched KEGG pathways:", length(ekegg$ID), "\n")
+    }
+    
+  } else {
+    print("No genes could be mapped to Entrez IDs")
+  }
+} else {
+  print("No significant genes found")
+}
+
+```
+
+```{r}
+
+# Prepare clinical data for survival analysis
+survival_data <- matched_data %>%
+  dplyr::select(sample_id, HER2_status, OS_STATUS, 
+         OS_MONTHS) %>%
+  distinct() %>%
+  mutate(
+    time = as.numeric(OS_MONTHS),
+    status = ifelse(OS_STATUS == "1:DECEASED", 1, 0)
+  ) %>%
+  # Filter out invalid survival times
+  filter(!is.na(time) & !is.na(status) & time > 0)
+
+# Print survival data summary
+print("Survival data summary after filtering:")
+print(summary(survival_data))
+print(paste("Number of samples after filtering:", nrow(survival_data)))
+
+# Get expression data for DE genes
+de_genes <- res_df[!is.na(res_df$padj) & res_df$padj < 0.05, "gene_id"]
+
+vst_matrix <- assay(vst)
+
+expr_data <- vst_matrix[match(de_genes, rownames(vst_matrix)), ]
+
+# Match samples between expression and survival data
+common_samples <- intersect(colnames(expr_data), survival_data$sample_id)
+expr_data <- expr_data[, common_samples]
+survival_data <- survival_data[match(common_samples, survival_data$sample_id), ]
+
+print("Final dimensions after matching:")
+print(paste("Expression data:", paste(dim(expr_data), collapse=" x ")))
+print(paste("Survival data rows:", nrow(survival_data)))
+
+# Create survival object
+y <- Surv(survival_data$time, survival_data$status)
+
+# Prepare expression matrix for glmnet
+x <- t(expr_data)
+
+# Handle any NA values in expression data
+if (any(is.na(x))) {
+  print("Warning: NA values found in expression data. Imputing with column means...")
+  x <- apply(x, 2, function(col) {
+    col[is.na(col)] <- mean(col, na.rm = TRUE)
+    return(col)
+  })
+}
+
+# Perform cross-validation to find optimal lambda
+set.seed(42)
+cv_fit <- cv.glmnet(x, y, family = "cox", alpha = 1)
+
+# Fit final model using optimal lambda
+final_fit <- glmnet(x, y, family = "cox", alpha = 1, lambda = cv_fit$lambda.min)
+
+# Get non-zero coefficients
+coef_matrix <- coef(final_fit)
+selected_genes <- rownames(coef_matrix)[which(coef_matrix != 0)]
+print(paste("Number of genes selected by LASSO:", length(selected_genes)))
+
+# Calculate risk scores
+risk_scores <- predict(final_fit, newx = x, type = "response")
+
+# Add risk scores to survival data
+survival_data$risk_score <- as.vector(risk_scores)
+survival_data$risk_group <- ifelse(risk_scores > median(risk_scores), "High", "Low")
+
+# Create survival curves
+surv_fit <- survfit(Surv(time, status) ~ risk_group, data = survival_data)
+
+# Plot survival curves
+surv_plot <- ggsurvplot(
+  surv_fit,
+  data = survival_data,
+  pval = TRUE,
+  risk.table = TRUE,
+  conf.int = TRUE,
+  xlab = "Time (Months)",
+  ylab = "Overall Survival Probability",
+  title = "Survival Analysis by Risk Group",
+  risk.table.height = 0.3,
+  ggtheme = theme_minimal()
+)
+
+# Save plots
+ggsave("survival_plot.png", surv_plot$plot, width = 10, height = 8)
+ggsave("risk_table.png", surv_plot$table, width = 10, height = 3)
+
+# Save selected genes
+selected_gene_coef <- data.frame(
+  gene = rownames(coef_matrix)[which(coef_matrix != 0)],
+  coefficient = as.vector(coef_matrix)[which(coef_matrix != 0)]
+)
+write.csv(selected_gene_coef, "selected_genes_lasso.csv", row.names = FALSE)
+
+# Print model statistics
+print("\nModel Statistics:")
+print(paste("Optimal lambda:", cv_fit$lambda.min))
+print(paste("Number of non-zero coefficients:", length(which(coef_matrix != 0))))
+
+# Log-rank test
+log_rank <- survdiff(Surv(time, status) ~ risk_group, data = survival_data)
+print("\nLog-rank test results:")
+print(log_rank)
+
+# Concordance index
+cindex <- concordance(Surv(time, status) ~ risk_score, data = survival_data)
+print("\nConcordance index:")
+print(cindex$concordance)
+
+# Save results
+results <- list(
+  survival_data = survival_data,
+  lasso_model = final_fit,
+  cv_fit = cv_fit,
+  selected_genes = selected_genes,
+  concordance = cindex$concordance,
+  log_rank = log_rank
+)
+saveRDS(results, "survival_analysis_results.rds")
+
+```
